@@ -282,22 +282,25 @@ where
         let mut views_to_report = HashMap::new();
         let mut sinks_to_report = HashMap::new();
         for (id, oid, name, item) in catalog_entries {
-            if let Ok(desc) = item.desc(&name) {
-                self.report_column_updates(desc, id, 1).await?;
-            }
             match item {
                 CatalogItem::Index(index) => {
                     self.report_index_update(oid, id, &index, &name.item, 1)
                         .await
                 }
-                CatalogItem::Table(_) => {
+                CatalogItem::Table(table) => {
                     tables_to_report.insert(id, oid);
+                    self.report_column_updates(&id, &table.desc, &table.column_oids, 1)
+                        .await?;
                 }
-                CatalogItem::Source(_) => {
+                CatalogItem::Source(source) => {
                     sources_to_report.insert(id, oid);
+                    self.report_column_updates(&id, &source.desc, &source.column_oids, 1)
+                        .await?;
                 }
-                CatalogItem::View(_) => {
+                CatalogItem::View(view) => {
                     views_to_report.insert(id, oid);
+                    self.report_column_updates(&id, &view.desc, &view.column_oids, 1)
+                        .await?;
                 }
                 CatalogItem::Sink(_) => {
                     sinks_to_report.insert(id, oid);
@@ -1066,24 +1069,26 @@ where
 
     async fn report_column_updates(
         &mut self,
+        global_id: &GlobalId,
         desc: &RelationDesc,
-        global_id: GlobalId,
+        oids: &[u32],
         diff: isize,
     ) -> Result<(), anyhow::Error> {
-        for (i, (column_name, column_type)) in desc.iter().enumerate() {
+        for (i, ((name, typ), oid)) in desc.iter().zip(oids).enumerate() {
             self.update_catalog_view(
                 MZ_COLUMNS.id,
                 iter::once((
                     Row::pack(&[
+                        Datum::Int32(*oid as i32),
                         Datum::String(&global_id.to_string()),
                         Datum::Int64(i as i64),
                         Datum::String(
-                            &column_name
+                            &name
                                 .map(|n| n.to_string())
                                 .unwrap_or_else(|| "?column?".to_owned()),
                         ),
-                        Datum::from(column_type.nullable),
-                        Datum::String(pgrepr::Type::from(&column_type.scalar_type).name()),
+                        Datum::from(typ.nullable),
+                        Datum::String(pgrepr::Type::from(&typ.scalar_type).name()),
                     ]),
                     diff,
                 )),
@@ -1533,10 +1538,12 @@ where
         if_not_exists: bool,
     ) -> Result<ExecuteResponse, anyhow::Error> {
         let table_id = self.catalog.allocate_id()?;
+        let column_oids = self.catalog.allocate_oids(table.desc.arity())?;
         let table = catalog::Table {
             create_sql: table.create_sql,
             plan_cx: pcx,
             desc: table.desc,
+            column_oids,
         };
         let index_id = self.catalog.allocate_id()?;
         let mut index_name = name.clone();
@@ -1580,11 +1587,13 @@ where
         if_not_exists: bool,
         materialized: bool,
     ) -> Result<ExecuteResponse, anyhow::Error> {
+        let column_oids = self.catalog.allocate_oids(source.desc.arity())?;
         let source = catalog::Source {
             create_sql: source.create_sql,
             plan_cx: pcx,
             connector: source.connector,
             desc: source.desc,
+            column_oids,
         };
         let source_id = self.catalog.allocate_id()?;
         let source_oid = self.catalog.allocate_oid()?;
@@ -1733,12 +1742,14 @@ where
         // Optimize the expression so that we can form an accurately typed description.
         let optimized_expr = self.optimizer.optimize(view.expr, self.catalog.indexes())?;
         let desc = RelationDesc::new(optimized_expr.as_ref().typ(), view.column_names);
+        let column_oids = self.catalog.allocate_oids(desc.arity())?;
         let view = catalog::View {
             create_sql: view.create_sql,
             plan_cx: pcx,
             optimized_expr,
             desc,
             conn_id: if view.temporary { Some(conn_id) } else { None },
+            column_oids,
         };
         ops.push(catalog::Op::CreateItem {
             id: view_id,
@@ -2428,33 +2439,34 @@ where
                     oid,
                     name,
                     item,
-                } => {
-                    if let Ok(desc) = item.desc(&name) {
-                        self.report_column_updates(desc, *id, 1).await?;
+                } => match item {
+                    CatalogItem::Index(index) => {
+                        self.report_index_update(*oid, *id, &index, &name.item, 1)
+                            .await
                     }
-                    match item {
-                        CatalogItem::Index(index) => {
-                            self.report_index_update(*oid, *id, &index, &name.item, 1)
-                                .await
-                        }
-                        CatalogItem::Table(_) => {
-                            self.report_table_update(*oid, id, *schema_id, &name.item, 1)
-                                .await
-                        }
-                        CatalogItem::Source(_) => {
-                            self.report_source_update(*oid, id, *schema_id, &name.item, 1)
-                                .await;
-                        }
-                        CatalogItem::View(_) => {
-                            self.report_view_update(*oid, id, *schema_id, &name.item, 1)
-                                .await;
-                        }
-                        CatalogItem::Sink(_) => {
-                            self.report_sink_update(*oid, id, *schema_id, &name.item, 1)
-                                .await;
-                        }
+                    CatalogItem::Table(table) => {
+                        self.report_table_update(*oid, id, *schema_id, &name.item, 1)
+                            .await;
+                        self.report_column_updates(id, &table.desc, &table.column_oids, 1)
+                            .await?;
                     }
-                }
+                    CatalogItem::Source(source) => {
+                        self.report_source_update(*oid, id, *schema_id, &name.item, 1)
+                            .await;
+                        self.report_column_updates(id, &source.desc, &source.column_oids, 1)
+                            .await?;
+                    }
+                    CatalogItem::View(view) => {
+                        self.report_view_update(*oid, id, *schema_id, &name.item, 1)
+                            .await;
+                        self.report_column_updates(id, &view.desc, &view.column_oids, 1)
+                            .await?;
+                    }
+                    CatalogItem::Sink(_) => {
+                        self.report_sink_update(*oid, id, *schema_id, &name.item, 1)
+                            .await;
+                    }
+                },
                 catalog::OpStatus::UpdatedItem {
                     schema_id,
                     id,
@@ -2533,7 +2545,7 @@ where
                 },
                 catalog::OpStatus::DroppedItem { schema_id, entry } => {
                     match entry.item() {
-                        CatalogItem::Table(_) => {
+                        CatalogItem::Table(table) => {
                             sources_to_drop.push(entry.id());
                             self.report_table_update(
                                 entry.oid(),
@@ -2543,8 +2555,15 @@ where
                                 -1,
                             )
                             .await;
+                            self.report_column_updates(
+                                &entry.id(),
+                                entry.desc()?,
+                                &table.column_oids,
+                                -1,
+                            )
+                            .await?;
                         }
-                        CatalogItem::Source(_) => {
+                        CatalogItem::Source(source) => {
                             sources_to_drop.push(entry.id());
                             self.report_source_update(
                                 entry.oid(),
@@ -2554,8 +2573,15 @@ where
                                 -1,
                             )
                             .await;
+                            self.report_column_updates(
+                                &entry.id(),
+                                entry.desc()?,
+                                &source.column_oids,
+                                -1,
+                            )
+                            .await?;
                         }
-                        CatalogItem::View(_) => {
+                        CatalogItem::View(view) => {
                             self.report_view_update(
                                 entry.oid(),
                                 &entry.id(),
@@ -2564,6 +2590,13 @@ where
                                 -1,
                             )
                             .await;
+                            self.report_column_updates(
+                                &entry.id(),
+                                entry.desc()?,
+                                &view.column_oids,
+                                -1,
+                            )
+                            .await?;
                         }
                         CatalogItem::Sink(catalog::Sink {
                             connector: SinkConnectorState::Ready(connector),
@@ -2614,9 +2647,6 @@ where
                         CatalogItem::Index(_) => {
                             unreachable!("dropped indexes should be handled by DroppedIndex");
                         }
-                    }
-                    if let Ok(desc) = entry.desc() {
-                        self.report_column_updates(desc, entry.id(), -1).await?;
                     }
                 }
                 _ => (),

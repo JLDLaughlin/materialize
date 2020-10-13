@@ -149,6 +149,7 @@ pub struct Table {
     pub create_sql: String,
     pub plan_cx: PlanContext,
     pub desc: RelationDesc,
+    pub column_oids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +158,7 @@ pub struct Source {
     pub plan_cx: PlanContext,
     pub connector: SourceConnector,
     pub desc: RelationDesc,
+    pub column_oids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +184,7 @@ pub struct View {
     pub optimized_expr: OptimizedRelationExpr,
     pub desc: RelationDesc,
     pub conn_id: Option<u32>,
+    pub column_oids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,6 +419,7 @@ impl Catalog {
                 Builtin::Log(log) if config.enable_logging => {
                     let index_name = format!("{}_primary_idx", log.name);
                     let oid = catalog.allocate_oid()?;
+                    let column_oids = catalog.allocate_oids(log.variant.desc().arity())?;
                     catalog.insert_item(
                         log.id,
                         oid,
@@ -425,6 +429,7 @@ impl Catalog {
                             plan_cx: PlanContext::default(),
                             connector: dataflow_types::SourceConnector::Local,
                             desc: log.variant.desc(),
+                            column_oids,
                         }),
                     );
                     let oid = catalog.allocate_oid()?;
@@ -465,6 +470,7 @@ impl Catalog {
                         &index_columns,
                     );
                     let oid = catalog.allocate_oid()?;
+                    let column_oids = catalog.allocate_oids(table.desc.arity())?;
                     catalog.insert_item(
                         table.id,
                         oid,
@@ -473,6 +479,7 @@ impl Catalog {
                             create_sql: "TODO".to_string(),
                             plan_cx: PlanContext::default(),
                             desc: table.desc.clone(),
+                            column_oids,
                         }),
                     );
                     let oid = catalog.allocate_oid()?;
@@ -579,6 +586,14 @@ impl Catalog {
         }
         self.oid_counter += 1;
         Ok(oid)
+    }
+
+    pub fn allocate_oids(&mut self, n: usize) -> Result<Vec<u32>, Error> {
+        let mut oids = Vec::with_capacity(n);
+        for _ in 0..n {
+            oids.push(self.allocate_oid()?);
+        }
+        Ok(oids)
     }
 
     pub fn resolve_schema(
@@ -1358,7 +1373,7 @@ impl Catalog {
         serde_json::to_vec(&item).expect("catalog serialization cannot fail")
     }
 
-    fn deserialize_item(&self, bytes: Vec<u8>) -> Result<CatalogItem, anyhow::Error> {
+    fn deserialize_item(&mut self, bytes: Vec<u8>) -> Result<CatalogItem, anyhow::Error> {
         let SerializedCatalogItem::V1 {
             create_sql,
             eval_env,
@@ -1374,7 +1389,7 @@ impl Catalog {
     }
 
     fn parse_item(
-        &self,
+        &mut self,
         create_sql: String,
         pcx: PlanContext,
     ) -> Result<CatalogItem, anyhow::Error> {
@@ -1385,27 +1400,37 @@ impl Catalog {
         };
         let plan = sql::plan::plan(&pcx, &self.for_system_session(), stmt, &params)?;
         Ok(match plan {
-            Plan::CreateTable { table, .. } => CatalogItem::Table(Table {
-                create_sql: table.create_sql,
-                plan_cx: pcx,
-                desc: table.desc,
-            }),
-            Plan::CreateSource { source, .. } => CatalogItem::Source(Source {
-                create_sql: source.create_sql,
-                plan_cx: pcx,
-                connector: source.connector,
-                desc: source.desc,
-            }),
+            Plan::CreateTable { table, .. } => {
+                let column_oids = self.allocate_oids(table.desc.arity())?;
+                CatalogItem::Table(Table {
+                    create_sql: table.create_sql,
+                    plan_cx: pcx,
+                    desc: table.desc,
+                    column_oids,
+                })
+            }
+            Plan::CreateSource { source, .. } => {
+                let column_oids = self.allocate_oids(source.desc.arity())?;
+                CatalogItem::Source(Source {
+                    create_sql: source.create_sql,
+                    plan_cx: pcx,
+                    connector: source.connector,
+                    desc: source.desc,
+                    column_oids,
+                })
+            }
             Plan::CreateView { view, .. } => {
                 let mut optimizer = Optimizer::default();
                 let optimized_expr = optimizer.optimize(view.expr, self.indexes())?;
                 let desc = RelationDesc::new(optimized_expr.as_ref().typ(), view.column_names);
+                let column_oids = self.allocate_oids(desc.arity())?;
                 CatalogItem::View(View {
                     create_sql: view.create_sql,
                     plan_cx: pcx,
                     optimized_expr,
                     desc,
                     conn_id: None,
+                    column_oids,
                 })
             }
             Plan::CreateIndex { index, .. } => CatalogItem::Index(Index {
